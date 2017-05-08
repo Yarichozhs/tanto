@@ -1,6 +1,6 @@
 /*
- *  Yari - In memory Key Value Store 
- *  Copyright (C) 2017  Yari 
+ *  Tanto - Object based file system
+ *  Copyright (C) 2017  Tanto 
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
