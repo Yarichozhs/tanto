@@ -49,6 +49,9 @@ struct tanto_fobj_t
   gid_t     gid;
   int32_t   nblocks;
   int32_t   bsize;
+  int64_t   actime; /* last access */
+  int64_t   modtime; /* last modification */
+  int64_t   ctime;  /* creation time */
 };
 typedef struct tanto_fobj_t tanto_fobj_t;
 
@@ -89,11 +92,20 @@ __thread tanto_ctx_t tanto_ctx;
 
 #define tanto_redis_ctx() (&tanto_ctx.redis_ctx)
 
+#define tanto_ns2timespec(ts, t)\
+        do \
+	{ \
+	  (ts)->tv_sec  = (t) / (1000 * 1000 * 1000); \
+	  (ts)->tv_nsec = (t) % (1000 * 1000 * 1000); \
+	} \
+	while (0)
+
 static int tanto_add_obj(const char *path, mode_t mode, uid_t uid, gid_t gid)
 {
   tanto_fobj_t fobj;
   char         key[TANTO_KEY_MAXLEN];
   int          keyl;
+  size_t       cur_us = ytime_get();
   
   memset(&fobj, 0, sizeof(&fobj));
 
@@ -102,7 +114,10 @@ static int tanto_add_obj(const char *path, mode_t mode, uid_t uid, gid_t gid)
   fobj.mode  = mode;
   fobj.uid   = uid;
   fobj.gid   = gid;
-  fobj.seqno = ytime_get()/1000/1000;                  /* convert to seconds */
+  fobj.seqno = cur_us/1000/1000;                       /* convert to seconds */
+  fobj.modtime = cur_us * 1000;                           /* in nano seconds */
+  fobj.actime  = cur_us * 1000;
+  fobj.ctime   = cur_us * 1000;
 
   if (redis_set(tanto_redis_ctx(), key, keyl, 
                 (void *)&fobj, sizeof(tanto_fobj_t)) < 0)
@@ -155,7 +170,7 @@ static int tanto_file_get(tanto_file_t *file, const char *path)
 
 static int tanto_file_sync(tanto_file_t *file)
 {
-  ytrace_msg(YTRACE_LEVEL1, "path = %s\n", file->path);
+  ytrace_msg(YTRACE_LEVEL1, "path = %s %s\n", file->path, file->key);
 
   if (redis_set(tanto_redis_ctx(), file->key, file->keyl, 
                 (void *)&file->fobj, sizeof(tanto_fobj_t)) < 0) 
@@ -192,7 +207,7 @@ static int tanto_file_write(tanto_file_t *file,
 {
   int     keyl;
   void   *bp;
-  size_t  blk_ind;
+  size_t  blk_ind = 0;
   size_t  noffset;
   size_t  ioffset;
   size_t  tsize;
@@ -201,14 +216,14 @@ static int tanto_file_write(tanto_file_t *file,
   char    ldata[TANTO_BLOCK_SIZE];
   size_t  nblocks = 0;
 
-  ytrace_msg(YTRACE_LEVEL1, "block_ind = %lu\n", (unsigned long)blk_ind);
-
   while (rem)
   {
     noffset = (offset + TANTO_BLOCK_SIZE) & ~(TANTO_BLOCK_SIZE - 1);
     
     tsize   = noffset - offset;
     blk_ind = offset / TANTO_BLOCK_SIZE;
+
+    ytrace_msg(YTRACE_LEVEL1, "block_ind = %lu\n", (unsigned long)blk_ind);
 
     keyl    = tanto_data_key(key, file->path, blk_ind);
     bp      = data;
@@ -241,9 +256,12 @@ static int tanto_file_write(tanto_file_t *file,
     data    = (void *)((char *)data + tsize);
   }
 
-  if (file->fobj.nblocks < nblocks)                 /* update on size change */
+  ytrace_msg(YTRACE_LEVEL1, "nblocks = %lu : blk_ind = %lu\n" , 
+             file->fobj.nblocks, blk_ind);
+
+  if (file->fobj.nblocks < blk_ind)                 /* update on size change */
   {
-    file->fobj.nblocks = nblocks;
+    file->fobj.nblocks = blk_ind;
     tanto_file_sync(file);
   }
 
@@ -476,18 +494,17 @@ static int tanto_getattr(const char *path, struct stat *stbuf)
   stbuf->st_gid   = fobj->gid;
   stbuf->st_size  = fobj->nblocks * TANTO_BLOCK_SIZE;
   stbuf->st_blksize = TANTO_BLOCK_SIZE;
-  stbuf->st_blocks  = fobj->nblocks ;
+  stbuf->st_blocks  = fobj->nblocks;
 
-  ytrace_msg(YTRACE_LEVEL1, "seq = %d : mode = %o : size = %lu\n",
-             fobj->seqno, fobj->mode, fobj->nblocks * TANTO_BLOCK_SIZE);
+  tanto_ns2timespec(&stbuf->st_atim, fobj->actime);
+  tanto_ns2timespec(&stbuf->st_mtim, fobj->modtime);
+  tanto_ns2timespec(&stbuf->st_ctim, fobj->ctime);
+
+  ytrace_msg(YTRACE_LEVEL1, "seq = %d : mode = %o : size = %lu = actime = %lu\n",
+             fobj->seqno, fobj->mode, fobj->nblocks * TANTO_BLOCK_SIZE,
+	     fobj->actime);
 
   return 0;
-}
-
-static int tanto_readlink(const char *path, char *buf, size_t size)
-{
-  /* TANTO TODO :  */
-  return -ENOENT;
 }
 
 static int tanto_getdir(const char *path, fuse_dirh_t h, fuse_dirfil_t filler)
@@ -640,9 +657,44 @@ static int tanto_rmdir(const char *path)
 
 static int tanto_symlink(const char *from, const char *to)
 {
-  /* TANTO : TODO */
-  ytrace_msg(YTRACE_LEVEL1, "path = %s\n", from);
-  return -ENOENT;
+  char         data[TANTO_BLOCK_SIZE];
+  mode_t       mode = 0777;
+  tanto_file_t file;
+
+  ytrace_msg(YTRACE_LEVEL1, "from = %s to = %s\n", from, to);
+
+  if (tanto_mknod(to, S_IFLNK|mode, 0) < 0)
+    return -EPERM;
+
+  if (tanto_file_get(&file, to) < 0)
+    return -ENOENT;
+
+  strcpy(data, from);
+
+  if (tanto_file_write(&file, data, sizeof(data), 0) < 0)
+    return -ENOMEM;
+
+  return 0;
+}
+
+static int tanto_readlink(const char *path, char *buf, size_t size)
+{
+  char         data[TANTO_BLOCK_SIZE];
+  tanto_file_t file;
+
+  ytrace_msg(YTRACE_LEVEL1, "path = %s\n", path);
+
+  if (tanto_file_get(&file, path) < 0)
+    return -ENOENT;
+
+  if (tanto_file_read(&file, 0, data, sizeof(data)) < 0)
+    return -EINVAL;
+
+  strncpy(buf, data, size);
+
+  ytrace_msg(YTRACE_LEVEL1, "link = %.*s\n", size, buf);
+
+  return 0;
 }
 
 static int tanto_rename(const char *from, const char *to)
@@ -660,16 +712,36 @@ static int tanto_link(const char *from, const char *to)
 
 static int tanto_chmod(const char *path, mode_t mode)
 {
-  /* TANTO : TODO */
-  ytrace_msg(YTRACE_LEVEL1, "path = %s %d\n", path, mode);
-  return -ENOENT;
+  tanto_file_t  file;
+
+  if (tanto_file_get(&file, path) < 0)
+    return -ENOENT;
+
+  ytrace_msg(YTRACE_LEVEL1, "path = %s %o %o\n", path, mode, file.fobj.mode);
+
+  file.fobj.mode = mode;
+
+  tanto_file_sync(&file);
+
+  return 0;
 }
 
 static int tanto_chown(const char *path, uid_t uid, gid_t gid)
 {
-  /* TANTO : TODO */
+  tanto_file_t  file;
+
+  if (tanto_file_get(&file, path) < 0)
+    return -ENOENT;
+
+  file.fobj.uid = uid;
+  file.fobj.gid = gid;
+
+  if (tanto_file_sync(&file) < 0)
+    return -EINVAL;
+
   ytrace_msg(YTRACE_LEVEL1, "path = %s : %d %d \n", path, uid, gid);
-  return -ENOENT;
+
+  return 0;
 }
 
 static int tanto_truncate(const char *path, off_t size)
@@ -708,19 +780,17 @@ static int tanto_truncate(const char *path, off_t size)
 static int tanto_utime(const char *path, struct utimbuf *buf)
 {
   int          ret;
-  tanto_fobj_t fobj;
+  tanto_file_t file;
 
   ytrace_msg(YTRACE_LEVEL1, "%s: path = %s\n", __func__, path);
 
-  ret = tanto_get_obj(&fobj, path);
+  ret = tanto_file_get(&file, path);
 
   if (ret != 0)
     return ret;
 
-  buf->actime  = 0;
-  buf->modtime = 0;
-
-  /* TANTO : TODO */
+  file.fobj.actime =  (size_t)buf->actime  * 1000 * 1000 * 1000;
+  file.fobj.modtime = (size_t)buf->modtime * 1000 * 1000 * 1000;
 
   return ret;
 }
@@ -808,8 +878,16 @@ static int tanto_write(const char *path, const char *buf, size_t size,
 
 static int tanto_statfs(const char *path, struct statvfs *fst)
 {
-  /* TODO */
-  return -1;
+  fst->f_bsize  = TANTO_BLOCK_SIZE;
+  fst->f_frsize = TANTO_BLOCK_SIZE;
+  fst->f_blocks = -1;
+  fst->f_bfree  = -1;
+  fst->f_bavail = -1;
+  fst->f_files  = -1;
+  fst->f_ffree  = -1;
+  fst->f_favail = -1;
+  fst->f_namemax = TANTO_NAME_MAX;
+  return 0;
 }
 
 static int tanto_release(const char *path, struct fuse_file_info *finfo)

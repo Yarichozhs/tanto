@@ -164,8 +164,11 @@ int redis_get(redis_ctx_t *ctx, char *key, int klen, void *val, int vlen)
   while (to_read)
   {
     rc = read(ctx->sfd, buf, sizeof(buf));
-      
+
     if (rc == -1)
+      break;
+
+    if (rc == 1 && buf[0] == '\n')  /* redis sends only the \n in some cases */
       break;
 
     to_read -= rc;
